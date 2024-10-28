@@ -1,11 +1,14 @@
+import base64
+import io
 import json
 import pathlib
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Iterable, Iterator, List, Optional, Tuple, TypedDict, Union
 
+import torch
 from pydantic import Field
-from typing_extensions import Annotated
+from typing_extensions import Annotated, final
 
 from vllm.config import ModelConfig
 from vllm.engine.protocol import AsyncEngineClient
@@ -55,9 +58,15 @@ AnyRequest = Union[ChatCompletionRequest, CompletionRequest, DetokenizeRequest,
                    EmbeddingRequest, TokenizeRequest]
 
 
+@final
 class TextTokensPrompt(TypedDict):
     prompt: str
     prompt_token_ids: List[int]
+
+
+@final
+class EmbedsPrompt(TypedDict):
+    prompt_embeds: torch.Tensor
 
 
 class OpenAIServing:
@@ -334,7 +343,8 @@ class OpenAIServing:
         self,
         request: AnyRequest,
         tokenizer: AnyTokenizer,
-        input_or_inputs: Union[str, List[str], List[int], List[List[int]]],
+        input_or_inputs: Optional[Union[str, List[str], List[int],
+                                        List[List[int]]]],
         truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
         add_special_tokens: bool = True,
     ) -> Iterator[TextTokensPrompt]:
@@ -345,44 +355,73 @@ class OpenAIServing:
         , each input can be a string or array of tokens. Note that each request
         can pass one or more inputs.
         """
-        for prompt_input in parse_and_batch_prompt(input_or_inputs):
-            # Although our type checking is based on mypy,
-            # VSCode Pyright extension should still work properly
-            # "is True" is required for Pyright to perform type narrowing
-            # See: https://github.com/microsoft/pyright/issues/7672
-            if prompt_input["is_tokens"] is False:
-                yield self._normalize_prompt_text_to_input(
-                    request,
-                    tokenizer,
-                    prompt=prompt_input["content"],
-                    truncate_prompt_tokens=truncate_prompt_tokens,
-                    add_special_tokens=add_special_tokens,
-                )
+        if input_or_inputs:
+            for prompt_input in parse_and_batch_prompt(input_or_inputs):
+                # Although our type checking is based on mypy,
+                # VSCode Pyright extension should still work properly
+                # "is True" is required for Pyright to perform type narrowing
+                # See: https://github.com/microsoft/pyright/issues/7672
+                if prompt_input["is_tokens"] is False:
+                    yield self._normalize_prompt_text_to_input(
+                        request,
+                        tokenizer,
+                        prompt=prompt_input["content"],
+                        truncate_prompt_tokens=truncate_prompt_tokens,
+                        add_special_tokens=add_special_tokens,
+                    )
+                else:
+                    yield self._normalize_prompt_tokens_to_input(
+                        request,
+                        tokenizer,
+                        prompt_ids=prompt_input["content"],
+                        truncate_prompt_tokens=truncate_prompt_tokens,
+                    )
+
+    def _load_prompt_embeds(
+        self,
+        prompt_embeds: Optional[Union[bytes, List[bytes]]],
+        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    ) -> List[EmbedsPrompt]:
+
+        def _load_and_validate_embed(embed: bytes) -> EmbedsPrompt:
+            tensor = torch.load(io.BytesIO(base64.b64decode(embed)))
+            assert isinstance(
+                tensor,
+                (torch.FloatTensor, torch.BFloat16Tensor, torch.HalfTensor))
+            if tensor.dim() > 2:
+                tensor = tensor.squeeze(0)
+                assert tensor.dim() == 2
+            if truncate_prompt_tokens is not None:
+                tensor = tensor[-truncate_prompt_tokens:]
+            return {"prompt_embeds": tensor}
+
+        if prompt_embeds:
+            if isinstance(prompt_embeds, list):
+                return [
+                    _load_and_validate_embed(embed) for embed in prompt_embeds
+                ]
             else:
-                yield self._normalize_prompt_tokens_to_input(
-                    request,
-                    tokenizer,
-                    prompt_ids=prompt_input["content"],
-                    truncate_prompt_tokens=truncate_prompt_tokens,
-                )
+                return [_load_and_validate_embed(prompt_embeds)]
+        else:
+            return []
 
     def _log_inputs(
         self,
         request_id: str,
-        inputs: Union[str, List[int], TextTokensPrompt],
+        inputs: Union[str, List[int], TextTokensPrompt, EmbedsPrompt],
         params: Optional[Union[SamplingParams, PoolingParams]],
         lora_request: Optional[LoRARequest],
         prompt_adapter_request: Optional[PromptAdapterRequest],
     ) -> None:
         if self.request_logger is None:
             return
-
+        prompt, prompt_token_ids, prompt_embeds = None, None, None
         if isinstance(inputs, str):
             prompt = inputs
-            prompt_token_ids = None
         elif isinstance(inputs, list):
-            prompt = None
             prompt_token_ids = inputs
+        elif 'prompt_embeds' in inputs:
+            prompt_embeds = inputs.get("prompt_embeds")
         else:
             prompt = inputs["prompt"]
             prompt_token_ids = inputs["prompt_token_ids"]
@@ -391,6 +430,7 @@ class OpenAIServing:
             request_id,
             prompt,
             prompt_token_ids,
+            prompt_embeds,
             params=params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,

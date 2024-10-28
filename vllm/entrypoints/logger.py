@@ -1,5 +1,7 @@
 from typing import List, Optional, Union
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
@@ -21,6 +23,7 @@ class RequestLogger:
         request_id: str,
         prompt: Optional[str],
         prompt_token_ids: Optional[List[int]],
+        prompt_embeds: Optional[torch.Tensor],
         params: Optional[Union[SamplingParams, PoolingParams]],
         lora_request: Optional[LoRARequest],
         prompt_adapter_request: Optional[PromptAdapterRequest],
@@ -36,6 +39,8 @@ class RequestLogger:
         logger.info(
             "Received request %s: prompt: %r, "
             "params: %s, prompt_token_ids: %s, "
+            "promp_embeds of shape: %s, "
             "lora_request: %s, prompt_adapter_request: %s.", request_id,
-            prompt, params, prompt_token_ids, lora_request,
-            prompt_adapter_request)
+            prompt, params, prompt_token_ids,
+            prompt_embeds.shape if prompt_embeds is not None else None,
+            lora_request, prompt_adapter_request)
