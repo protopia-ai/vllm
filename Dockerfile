@@ -203,7 +203,7 @@ FROM vllm-base AS vllm-openai
 # install additional dependencies for openai api server
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install accelerate hf_transfer 'modelscope!=1.15.0' "setuptools>=74.1.1"
-
+COPY ray_init.sh .
 ENV VLLM_USAGE_SOURCE production-docker-image
 
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server", "--enable-chunked-prefill=False"]
