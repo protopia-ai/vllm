@@ -47,7 +47,8 @@ class EngineCoreRequest(
         gc=False):  # type: ignore[call-arg]
 
     request_id: str
-    prompt_token_ids: list[int]
+    prompt_token_ids: Optional[list[int]]
+    prompt_embeds: Optional[torch.Tensor]
     mm_kwargs: Optional[Sequence[Optional[MultiModalKwargsItem]]]
     mm_hashes: Optional[list[str]]
     mm_placeholders: Optional[list[PlaceholderRange]]

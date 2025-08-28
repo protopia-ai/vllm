@@ -14,7 +14,8 @@ from vllm.multimodal.inputs import (MultiModalKwargsItem,
                                     MultiModalKwargsItems, PlaceholderRange)
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
-from vllm.utils import swap_dict_values
+from vllm.utils import (length_from_prompt_token_ids_or_prompt_embeds,
+                        swap_dict_values)
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import (BatchUpdateBuilder,
@@ -30,7 +31,8 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 class CachedRequestState:
 
     req_id: str
-    prompt_token_ids: list[int]
+    prompt_token_ids: Optional[list[int]]
+    prompt_embeds: Optional[torch.Tensor]
     mm_kwargs: list[MultiModalKwargsItem]
     mm_positions: list[PlaceholderRange]
     mm_hashes: list[str]
@@ -48,7 +50,8 @@ class CachedRequestState:
     lora_request: Optional[LoRARequest] = None
 
     def __post_init__(self):
-        self.num_prompt_tokens = len(self.prompt_token_ids)
+        self.num_prompt_tokens = length_from_prompt_token_ids_or_prompt_embeds(
+            self.prompt_token_ids, self.prompt_embeds)
 
     @property
     def num_tokens(self) -> int:
@@ -65,6 +68,10 @@ class CachedRequestState:
 
     def get_token_id(self, idx: int) -> int:
         if idx < self.num_prompt_tokens:
+            if self.prompt_token_ids is None:
+                raise ValueError(
+                    f"Tried to access token index {idx}, but that token was "
+                    "provided via prompt_embeds, and its ID is unknown.")
             return self.prompt_token_ids[idx]
         return self.output_token_ids[idx - self.num_prompt_tokens]
 
@@ -79,6 +86,8 @@ class InputBatch:
         device: torch.device,
         pin_memory: bool,
         vocab_size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
         block_sizes: list[int],  # The block_size of each kv cache group
         logitsprocs: Optional[LogitsProcessors] = None,
         is_spec_decode: bool = False,
@@ -92,6 +101,8 @@ class InputBatch:
         self.device = device
         self.pin_memory = pin_memory
         self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.dtype = dtype
 
         self._req_ids: list[Optional[str]] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -107,6 +118,15 @@ class InputBatch:
             pin_memory=False,
         )
         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        self.prompt_embeds_cpu_tensor = torch.zeros(
+            (max_num_reqs, max_model_len, hidden_size),
+            device="cpu",
+            dtype=dtype,
+            pin_memory=False)
+        self.is_prompt_embeds = torch.zeros((max_num_reqs, max_model_len),
+                                            device="cpu",
+                                            dtype=bool,
+                                            pin_memory=False)
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
@@ -294,15 +314,24 @@ class InputBatch:
         self.req_id_to_index[req_id] = req_index
 
         # Copy the prompt token ids and output token ids.
-        num_prompt_tokens = len(request.prompt_token_ids)
+        num_prompt_tokens = length_from_prompt_token_ids_or_prompt_embeds(
+            request.prompt_token_ids, request.prompt_embeds)
+        # TODO: copy the prompt embeds
         self.num_prompt_tokens[req_index] = num_prompt_tokens
-        self.token_ids_cpu[
-            req_index, :num_prompt_tokens] = request.prompt_token_ids
         start_idx = num_prompt_tokens
         end_idx = start_idx + len(request.output_token_ids)
+        if request.prompt_token_ids is not None:
+            self.token_ids_cpu[
+                req_index, :num_prompt_tokens] = request.prompt_token_ids
+        if request.prompt_embeds is not None:
+            self.prompt_embeds_cpu_tensor[req_index, :num_prompt_tokens].copy_(
+                request.prompt_embeds)
+            self.is_prompt_embeds[req_index, :num_prompt_tokens] = True
+        else:
+            self.is_prompt_embeds[req_index, :num_prompt_tokens] = False
         self.token_ids_cpu[req_index,
                            start_idx:end_idx] = request.output_token_ids
-        # Number of token ids in token_ids_cpu.
+        # Number of token ids in prompt (token_ids_cpu or prompt_embeds).
         # NOTE(woosuk): This may include spec decode tokens.
         self.num_tokens[req_index] = request.num_tokens
         # Number of tokens without spec decode tokens.

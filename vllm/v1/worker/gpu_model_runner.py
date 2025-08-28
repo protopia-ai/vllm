@@ -9,7 +9,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, Union, cast, overload
 
 import numpy as np
 import torch
@@ -54,8 +54,9 @@ from vllm.sequence import IntermediateTensors, PoolerOutput
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         GiB_bytes, LazyLoader, cdiv, check_use_alibi,
-                        get_dtype_size, is_pin_memory_available, round_up,
-                        supports_dynamo)
+                        get_dtype_size, is_pin_memory_available,
+                        length_from_prompt_token_ids_or_prompt_embeds,
+                        round_up, supports_dynamo)
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport, AttentionMetadataBuilder, CommonAttentionMetadata,
     make_kv_sharing_fast_prefill_attention_metadata,
@@ -78,7 +79,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.utils import CpuGpuBuffer, CpuGpuBufferWithNumpy
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin, KVConnectorOutput)
@@ -132,6 +133,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
+        assert isinstance(self.dtype, torch.dtype)
         if cache_config.cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         else:
@@ -139,6 +141,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cache_config.cache_dtype]
 
         self.is_pooling_model = model_config.pooler_config is not None
+        self.enable_prompt_embeds = model_config.enable_prompt_embeds
         self.is_multimodal_raw_input_only_model = (
             model_config.is_multimodal_raw_input_only_model)
 
@@ -224,6 +227,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device=self.device,
             pin_memory=self.pin_memory,
             vocab_size=self.model_config.get_vocab_size(),
+            hidden_size=self.hidden_size,
+            dtype=self.dtype,
             block_sizes=[self.cache_config.block_size],
             is_spec_decode=bool(self.vllm_config.speculative_config),
             logitsprocs=build_logitsprocs(
@@ -253,10 +258,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.query_start_loc = self._make_buffer(self.max_num_reqs + 1,
                                                  dtype=torch.int32)
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
-        self.inputs_embeds = torch.zeros(
-            (self.max_num_tokens, self.hidden_size),
-            dtype=self.dtype,
-            device=self.device)
+        # Because inputs_embeds may be bfloat16 and we don't need a numpy
+        # version of this tensor, avoid a RuntimeError by not creating a
+        # numpy buffer.
+        self.inputs_embeds = self._make_buffer(self.max_num_tokens,
+                                               self.hidden_size,
+                                               dtype=self.dtype,
+                                               numpy=False)
+        self.is_inputs_embeds = self._make_buffer(self.max_num_tokens,
+                                                  dtype=torch.bool)
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -324,7 +334,31 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device="cpu",
             pin_memory=self.pin_memory)
 
-    def _make_buffer(self, *args, dtype: torch.dtype) -> CpuGpuBuffer:
+    @overload
+    def _make_buffer(self,
+                     *args: int | torch.SymInt,
+                     dtype: torch.dtype,
+                     numpy: Literal[True] = ...) -> CpuGpuBufferWithNumpy:
+        ...
+
+    @overload
+    def _make_buffer(self, *args: int | torch.SymInt, dtype: torch.dtype,
+                     numpy: Literal[False]) -> CpuGpuBuffer:
+        ...
+
+    def _make_buffer(
+            self,
+            *args: int | torch.SymInt,
+            dtype: torch.dtype,
+            numpy: bool = True) -> CpuGpuBuffer | CpuGpuBufferWithNumpy:
+        # Bfloat16 torch tensors cannot be directly cast to a numpy array, so
+        # if a bfloat16 buffer is needed without a corresponding numpy array,
+        # don't bother instantiating the numpy array.
+        if numpy:
+            return CpuGpuBufferWithNumpy(*args,
+                                         dtype=dtype,
+                                         device=self.device,
+                                         pin_memory=self.pin_memory)
         return CpuGpuBuffer(*args,
                             dtype=dtype,
                             device=self.device,
@@ -467,6 +501,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_state = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
+                prompt_embeds=new_req_data.prompt_embeds,
                 mm_kwargs=new_req_data.mm_kwargs,
                 mm_positions=new_req_data.mm_positions,
                 mm_hashes=new_req_data.mm_hashes,
@@ -722,6 +757,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                            0,
                            torch.from_numpy(token_indices),
                            out=self.input_ids.cpu[:total_num_scheduled_tokens])
+        prompt_embeds_cpu_tensor = \
+            self.input_batch.prompt_embeds_cpu_tensor.view(
+            -1, self.input_batch.prompt_embeds_cpu_tensor.shape[-1])
+        is_prompt_embeds = self.input_batch.is_prompt_embeds.flatten()
+        torch.index_select(
+            prompt_embeds_cpu_tensor,
+            0,
+            torch.from_numpy(token_indices),
+            out=self.inputs_embeds.cpu[:total_num_scheduled_tokens])
+        torch.index_select(
+            is_prompt_embeds,
+            0,
+            torch.from_numpy(token_indices),
+            out=self.is_inputs_embeds.cpu[:total_num_scheduled_tokens])
 
         self.input_batch.block_table.compute_slot_mapping(
             req_indices, positions_np)
@@ -748,6 +797,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Copy the tensors to the GPU.
         self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+        self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+        self.is_inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
@@ -1021,7 +1073,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.input_batch.num_computed_tokens_cpu[index]
             num_scheduled_tokens = \
                 scheduler_output.num_scheduled_tokens[req_id]
-            num_prompt_tokens = len(req.prompt_token_ids)
+            num_prompt_tokens = length_from_prompt_token_ids_or_prompt_embeds(
+                req.prompt_token_ids, req.prompt_embeds)
 
             if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
                 prompt_part_len = max(0,
@@ -1531,15 +1584,35 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
 
             # TODO(woosuk): Avoid the copy. Optimize.
-            self.inputs_embeds[:num_scheduled_tokens].copy_(
+            self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(
                 inputs_embeds_scheduled)
 
             input_ids = None
-            inputs_embeds = self.inputs_embeds[:num_input_tokens]
+            inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = {
                 **self._init_model_kwargs(num_scheduled_tokens),
                 **self._extract_mm_kwargs(scheduler_output),
             }
+        elif (self.enable_prompt_embeds
+              and self.is_inputs_embeds.gpu[:num_scheduled_tokens].any()
+              and get_pp_group().is_first_rank):
+            # Get the input embeddings for the tokens that are not input embeds,
+            # then put them into the appropriate positions.
+            token_ids_idx = self.is_inputs_embeds.gpu[:num_scheduled_tokens] \
+                .logical_not() \
+                .nonzero(as_tuple=False) \
+                .squeeze(1)
+            # Some tokens ids may need to become embeds
+            if token_ids_idx.numel() > 0:
+                token_ids = self.input_ids.gpu.index_select(0, token_ids_idx)
+                tokens_to_embeds = self.model.get_input_embeddings(
+                    input_ids=token_ids)
+                self.inputs_embeds.gpu.index_copy_(0, token_ids_idx,
+                                                   tokens_to_embeds)
+
+            inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
+            model_kwargs = self._init_model_kwargs(num_input_tokens)
+            input_ids = None
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
@@ -1592,10 +1665,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             hidden_states = model_output
             aux_hidden_states = None
 
-        # Broadcast PP output for external_launcher (torchrun)
-        # to make sure we are synced across pp ranks
-        # TODO: Support overlapping mirco-batches
-        # https://github.com/vllm-project/vllm/issues/18019
+    # Broadcast PP output for external_launcher (torchrun)
+    # to make sure we are synced across pp ranks
+    # TODO: Support overlapping mirco-batches
+    # https://github.com/vllm-project/vllm/issues/18019
         broadcast_pp_output = \
             self.parallel_config.distributed_executor_backend \
             == "external_launcher" and len(get_pp_group().ranks) > 0
@@ -2060,6 +2133,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Get metadata for this request.
             request = self.requests[req_id]
+            # TODO: Make sure this doesn't break things.
+            if request.prompt_token_ids is None:
+                # Prompt logprobs is incompatible with prompt embeddings
+                continue
+
             num_prompt_tokens = len(request.prompt_token_ids)
             prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
                 self.device, non_blocking=True)
@@ -2326,7 +2404,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                             num_scheduled_tokens):
             if self.supports_mm_inputs:
                 input_ids = None
-                inputs_embeds = self.inputs_embeds[:num_tokens]
+                inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
                 model_kwargs = {
                     **self._init_model_kwargs(num_tokens),
                     **self._dummy_mm_kwargs(num_reqs),
@@ -2897,6 +2975,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),
+                hidden_size=self.hidden_size,
+                dtype=self.dtype,
                 block_sizes=block_sizes,
                 is_spec_decode=bool(self.vllm_config.speculative_config),
                 logitsprocs=self.input_batch.logitsprocs,
