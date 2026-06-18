@@ -132,6 +132,8 @@ def externalize_prompt_embeds(args: tuple) -> list:
 
 def internalize_prompt_embeds(args: tuple) -> None:
     """Rebuild SharedTensorHandle stand-ins into mmap tensors (worker side)."""
+    if not _ENABLED:
+        return
     for a in args:
         new_reqs = getattr(a, "scheduled_new_reqs", None)
         if not new_reqs:
