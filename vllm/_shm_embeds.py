@@ -119,13 +119,13 @@ def externalize_prompt_embeds(args: tuple) -> list:
             # Externalize the prompt_embeds CPU tensor, skip None / non-tensors.
             # (CUDA tensors would need the cuda-IPC path, not file_system shm.)
             match getattr(req, "prompt_embeds", None):
-                case torch.Tensor() as t if not t.is_cuda:
+                case torch.Tensor() as t if t.is_cpu:
                     handle, src = shared_handle(t)
                     # Replace the tensor with the handle to the shared memory.
                     req.prompt_embeds = handle
                     keepalive.append(src)
                 case _:
-                    # No prompt_embeds or not a CPU tensor, leave as-is.
+                    # None, a non-tensor, or a non-CPU tensor: leave as-is.
                     continue
     return keepalive
 
