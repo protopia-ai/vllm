@@ -374,12 +374,18 @@ class MultiprocExecutor(Executor):
 
         # Swap large `prompt_embeds` tensors for filename-based shm handles so the
         # broadcast does not ship the full tensor. shm_keepalive holds the shared
-        # storages alive until all workers have rebuilt
+        # storages alive until all workers have rebuilt.
+
+        # Only correct when every reader is local: the handle is a /dev/shm path valid
+        # only on this host, but the broadcast also fans out to remote (cross-node)
+        # readers over TCP, which cannot mmap it. Fall back to the default path
+        # whenever any reader is remote.
         from vllm import _shm_embeds
 
+        shm_local_only = self.rpc_broadcast_mq.n_remote_reader == 0
         shm_keepalive = (
             _shm_embeds.externalize_prompt_embeds(args)
-            if send_method == "execute_model"
+            if send_method == "execute_model" and shm_local_only
             else []
         )
         self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
