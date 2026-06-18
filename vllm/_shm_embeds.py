@@ -20,6 +20,10 @@ from contextlib import contextmanager
 
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 _ENABLED = os.environ.get("VLLM_SHM_EMBEDS", "0") == "1"
 
 
@@ -124,9 +128,16 @@ def externalize_prompt_embeds(args: tuple) -> list:
                     # Replace the tensor with the handle to the shared memory.
                     req.prompt_embeds = handle
                     keepalive.append(src)
+                case torch.Tensor() as t:
+                    # Tensors must be on CPU to be externalized via this path.
+                    logger.warning_once(
+                        "prompt_embeds on %s, expected CPU; skipping shm externalize "
+                        "(falling back to the default broadcast).",
+                        t.device,
+                    )
                 case _:
-                    # None, a non-tensor, or a non-CPU tensor: leave as-is.
-                    continue
+                    # None (text-only request) or a non-tensor: nothing to externalize.
+                    pass
     return keepalive
 
 
