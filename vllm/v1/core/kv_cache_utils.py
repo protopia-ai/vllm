@@ -620,8 +620,11 @@ def _gen_prompt_embeds_extra_hash_keys(
     else:
         # Mixed prompt: hash the block's compact rows with its mask, so the
         # rows' positions are part of the key. A block of only token ids is
-        # covered by its token ids.
-        first_row, end_row = offsets[start_token_idx], offsets[end_token_idx]
+        # covered by its token ids. A block may extend past the prompt into
+        # output tokens, which have no embeds rows.
+        num_prompt = len(offsets) - 1
+        first_row = offsets[min(start_token_idx, num_prompt)]
+        end_row = offsets[min(end_token_idx, num_prompt)]
         if first_row == end_row:
             return []
     block_range = (start_token_idx, end_token_idx)

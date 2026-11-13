@@ -1002,6 +1002,25 @@ def test_generate_block_hash_extra_keys_compact_mixed_prompt_embeds():
     assert extra_keys == (("prompt_embeds", expected.digest()),)
 
 
+def test_generate_block_hash_extra_keys_mixed_block_past_prompt():
+    """The block holding the end of a mixed prompt also holds output tokens
+    once some are generated; only its prompt part has embeds rows."""
+    is_token_ids = [True] * 5 + [False] * 3
+    compact = torch.randn(is_token_ids.count(False), 3)
+    request = make_request(
+        request_id="0",
+        prompt_token_ids=list(range(len(is_token_ids))),
+        prompt_embeds=compact,
+        prompt_is_token_ids=is_token_ids,
+    )
+
+    extra_keys, _ = generate_block_hash_extra_keys(request, 5, 10, 0)
+    expected = hashlib.sha256(bytes(is_token_ids[5:10]))
+    expected.update(kv_cache_utils.tensor_data(compact))
+    assert extra_keys == (("prompt_embeds", expected.digest()),)
+    assert generate_block_hash_extra_keys(request, 10, 15, 0)[0] is None
+
+
 def test_generate_block_hash_extra_keys_prompt_embeds_cached(monkeypatch):
     prompt_embeds = torch.randn(10, 3)
     request = make_request(
