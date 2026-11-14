@@ -19,6 +19,7 @@ from vllm.renderers.embed_utils import (
     safe_load_prompt_embeds,
     safe_load_prompt_embeds_async,
 )
+from vllm.v1 import prompt_embeds_cache
 
 from .types import InputAudio, ModalityStr, MultiModalEmbedsPayload
 
@@ -379,6 +380,7 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         # Second tuple slot fills the tracker's generic `(item, uuid | None)`
         # contract. prompt_embeds has no UUID concept, so it's always `None`.
         tensor = await safe_load_prompt_embeds_async(self.model_config, data_bytes)
+        await prompt_embeds_cache.tag_part(tensor)
         return tensor, None
 
     async def _image_with_uuid_async(self, image_url: str | None, uuid: str | None):

@@ -240,6 +240,7 @@ if TYPE_CHECKING:
     VLLM_XGRAMMAR_CACHE_MB: int = 512
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
+    VLLM_PROMPT_EMBEDS_PART_CACHE_GB: float = 0.0
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
     VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
     VLLM_NIXL_SIDE_CHANNEL_HOST: str = "localhost"
@@ -1842,6 +1843,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # limit will actually be zero-copy decoded. The unit is bytes.
     "VLLM_MSGPACK_ZERO_COPY_THRESHOLD": lambda: int(
         os.getenv("VLLM_MSGPACK_ZERO_COPY_THRESHOLD", "256")
+    ),
+    # Size in GiB of the engine's cache of chat `prompt_embeds` parts, which
+    # lets the frontend send each part to the engine once instead of every
+    # turn. 0 disables it. See `vllm/v1/prompt_embeds_cache.py`.
+    "VLLM_PROMPT_EMBEDS_PART_CACHE_GB": lambda: float(
+        os.getenv("VLLM_PROMPT_EMBEDS_PART_CACHE_GB", "0")
     ),
     # If set, allow insecure serialization using pickle.
     # This is useful for environments where it is deemed safe to use the

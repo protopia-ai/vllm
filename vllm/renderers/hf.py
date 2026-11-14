@@ -56,6 +56,7 @@ from vllm.transformers_utils.chat_templates import (
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils.async_utils import make_async
 from vllm.utils.func_utils import supports_kw
+from vllm.v1 import prompt_embeds_cache
 
 from .base import BaseRenderer
 from .inputs.preprocess import parse_dec_only_prompt
@@ -250,6 +251,7 @@ def _build_mixed_prompt_embeds(
         full_embeds[start : start + length] = tensor
         is_token_ids[start : start + length] = False
 
+    prompt_embeds_cache.tag_joined(full_embeds, prompt_embeds_tensors, positions)
     return full_embeds, is_token_ids.tolist()
 
 
