@@ -195,3 +195,23 @@ def test_a_payload_that_is_not_base64_is_still_a_client_error(model_config):
         safe_load_prompt_embeds(model_config, b"!!!!not base64!!!!")
 
     assert int(create_error_response(excinfo.value).error.code) == 400
+
+
+def test_a_str_payload_loads_like_bytes(model_config):
+    """Chat requests hand the loader the JSON string itself, never encoded to
+    bytes first, so a `str` payload must load to the same tensor."""
+    tensor = torch.randn(3, model_config.get_hidden_size(), dtype=torch.float32)
+    encoded = _encode(_saved_tensor(tensor))
+
+    from_str = safe_load_prompt_embeds(model_config, encoded.decode())
+
+    torch.testing.assert_close(from_str, safe_load_prompt_embeds(model_config, encoded))
+
+
+def test_a_non_ascii_str_payload_is_a_client_error(model_config):
+    """`str.encode` used to turn non-ASCII into UTF-8 bytes for base64 to
+    reject; decoding the `str` directly must still answer 400."""
+    with pytest.raises(ValueError) as excinfo:
+        safe_load_prompt_embeds(model_config, "QUJDé")
+
+    assert int(create_error_response(excinfo.value).error.code) == 400
