@@ -72,6 +72,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceResult,
 )
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
+from vllm.v1.prompt_embeds_cache import PromptEmbedsPartSender
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
@@ -1207,6 +1208,7 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+        self.prompt_embeds_sender = PromptEmbedsPartSender.from_env()
 
         # locally-cached engine status
         self._engine_status: dict[int, dict] = {}
@@ -1241,6 +1243,7 @@ class AsyncMPClient(MPClient):
         _self_ref = weakref.ref(self)
         output_socket = resources.output_socket
         assert output_socket is not None
+        prompt_embeds_sender = self.prompt_embeds_sender
 
         notification_callback_handler: (
             Callable[[AsyncMPClient, Sequence[Any]], Any] | None
@@ -1282,6 +1285,12 @@ class AsyncMPClient(MPClient):
                                 outputs.utility_output, utility_results
                             )
                         continue
+
+                    if prompt_embeds_sender is not None and outputs.outputs:
+                        # Resend requests whose cached parts the engine evicted.
+                        for request in prompt_embeds_sender.take_misses(outputs):
+                            if _self := _self_ref():
+                                asyncio.create_task(_self.add_request_async(request))
 
                     if output_handler is not None:
                         assert _self_ref is not None
@@ -1373,6 +1382,8 @@ class AsyncMPClient(MPClient):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index
+        if self.prompt_embeds_sender is not None:
+            request = self.prompt_embeds_sender.to_refs(request, self.core_engine)
         await self._send_input(EngineCoreRequestType.ADD, _with_packed_prompt(request))
         self._ensure_output_queue_task()
 
@@ -1684,6 +1695,8 @@ class DPAsyncMPClient(AsyncMPClient):
 
         # The engine that receives it wakes the other ranks if they are idle.
         chosen_engine = self.get_core_engine_for_request(request)
+        if self.prompt_embeds_sender is not None:
+            request = self.prompt_embeds_sender.to_refs(request, chosen_engine)
         request = _with_packed_prompt(request)
         await self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
 

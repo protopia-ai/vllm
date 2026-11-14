@@ -24,6 +24,7 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
+from vllm.v1.prompt_embeds_cache import PromptEmbedsPartRef
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -224,6 +225,10 @@ class EngineCoreRequest(
     # Prompt block hashes computed by the frontend with the engine's
     # PrefixHashConfig, including any extra keys (LoRA, multimodal, cache salt).
     block_hashes: list[bytes] | None = None
+
+    # `prompt_embeds` as part refs, set instead of `prompt_embeds` when the
+    # engine caches parts (see `vllm/v1/prompt_embeds_cache.py`).
+    prompt_embeds_parts: list[PromptEmbedsPartRef] | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

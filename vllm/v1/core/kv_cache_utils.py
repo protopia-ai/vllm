@@ -25,6 +25,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.utils.hashing import xxhash, xxhash_cbor
+from vllm.v1 import prompt_embeds_cache
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroup,
@@ -616,6 +617,10 @@ def _gen_prompt_embeds_extra_hash_keys(
         return []
     block_range = (start_token_idx, end_token_idx)
     embeds_hash = request._prompt_embeds_per_block_hashes.get(block_range)
+    if embeds_hash is None:
+        embeds_hash = prompt_embeds_cache.block_hash(
+            request.prompt_embeds, start_token_idx, end_token_idx
+        )
     if embeds_hash is None:
         block_prompt_embeds = request.prompt_embeds[start_token_idx:end_token_idx]
         # Hash prompt embeds once per block and cache on request

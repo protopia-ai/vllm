@@ -55,6 +55,7 @@ from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
+from vllm.v1 import prompt_embeds_cache
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_planning import (
@@ -1261,6 +1262,8 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        prompt_embeds_cache.resolve_parts(request)
+
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.
