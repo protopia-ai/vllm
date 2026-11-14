@@ -2073,6 +2073,8 @@ def test_prompt_embeds_block_hashes_match_serial_hashing(
     block hash."""
     block_size, num_tokens = 4, 4 * 9 + 2  # nine full blocks and a partial one
     prompt_embeds = torch.randn((num_tokens, 8))
+    # These blocks are tiny; hash them in parallel anyway.
+    monkeypatch.setattr(kv_cache_utils, "_PROMPT_EMBEDS_PARALLEL_MIN_BLOCK_BYTES", 0)
 
     def request():
         return make_request(

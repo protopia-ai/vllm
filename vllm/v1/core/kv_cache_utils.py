@@ -632,6 +632,7 @@ def _hash_prompt_embeds_rows(request: Request, block_range: tuple[int, int]) -> 
 
 # hashlib releases the GIL while hashing large buffers, so threads scale with cores.
 _PROMPT_EMBEDS_HASH_THREADS = 8
+_PROMPT_EMBEDS_PARALLEL_MIN_BLOCK_BYTES = 1 << 20
 _prompt_embeds_hash_pool: ThreadPoolExecutor | None = None
 
 
@@ -645,14 +646,27 @@ def _prehash_prompt_embeds_blocks(
     todo = [r for r in block_ranges if r not in request._prompt_embeds_per_block_hashes]
     if len(todo) < 2:
         return
+    assert request.prompt_embeds is not None
+    start, end = todo[0]
+    if (end - start) * request.prompt_embeds[
+        :1
+    ].nbytes < _PROMPT_EMBEDS_PARALLEL_MIN_BLOCK_BYTES:
+        # Small blocks hash faster serially than threads can share the GIL.
+        return
     if _prompt_embeds_hash_pool is None:
         _prompt_embeds_hash_pool = ThreadPoolExecutor(
             _PROMPT_EMBEDS_HASH_THREADS, thread_name_prefix="prompt_embeds_hash"
         )
-    digests = _prompt_embeds_hash_pool.map(
-        lambda r: _hash_prompt_embeds_rows(request, r), todo
-    )
-    request._prompt_embeds_per_block_hashes.update(zip(todo, digests))
+    # One task per thread, each over a contiguous run of blocks: with small
+    # blocks, a task per block costs more in scheduling than it hashes.
+    num_chunks = min(_PROMPT_EMBEDS_HASH_THREADS, len(todo))
+    size = -(-len(todo) // num_chunks)
+    chunks = [todo[i : i + size] for i in range(0, len(todo), size)]
+    for chunk in _prompt_embeds_hash_pool.map(
+        lambda ranges: [(r, _hash_prompt_embeds_rows(request, r)) for r in ranges],
+        chunks,
+    ):
+        request._prompt_embeds_per_block_hashes.update(chunk)
 
 
 def generate_block_hash_extra_keys(
