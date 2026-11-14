@@ -37,6 +37,35 @@ else:
     Request = object
 
 
+@dataclass(frozen=True, slots=True)
+class UncomputedPromptEmbeds:
+    """The prompt embeddings and token ID flags of the positions not computed yet."""
+
+    embeds: "torch.Tensor | None"
+    is_token_ids: list[bool] | None
+    offset: int
+    """Prompt position of the first entry of `is_token_ids`, and of the first
+    row of `embeds` when there is no mask (mixed prompts' rows are compact)."""
+
+
+def strip_computed_prompt_embeds(
+    prompt_embeds: "torch.Tensor | None",
+    prompt_is_token_ids: list[bool] | None,
+    num_computed_tokens: int,
+) -> UncomputedPromptEmbeds:
+    """Slice the prompt embeddings and token ID flags to remove computed tokens."""
+    if prompt_embeds is None or not num_computed_tokens:
+        return UncomputedPromptEmbeds(prompt_embeds, prompt_is_token_ids, 0)
+    if prompt_is_token_ids is None:
+        offset = min(num_computed_tokens, len(prompt_embeds))
+        return UncomputedPromptEmbeds(prompt_embeds[offset:], None, offset)
+    offset = min(num_computed_tokens, len(prompt_is_token_ids))
+    first_row = prompt_is_token_ids[:offset].count(False)
+    return UncomputedPromptEmbeds(
+        prompt_embeds[first_row:], prompt_is_token_ids[offset:], offset
+    )
+
+
 @dataclass
 class NewRequestData:
     req_id: str
@@ -51,6 +80,7 @@ class NewRequestData:
     prefill_token_ids: list[int]
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    prompt_embeds_offset: int = 0
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
 
@@ -61,7 +91,17 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int],
         uses_mrope: bool = False,
+        slice_prompt_embeds: bool = False,
     ) -> "NewRequestData":
+        prompt_embeds = UncomputedPromptEmbeds(
+            request.prompt_embeds, request.prompt_is_token_ids, offset=0
+        )
+        if slice_prompt_embeds:
+            prompt_embeds = strip_computed_prompt_embeds(
+                request.prompt_embeds,
+                request.prompt_is_token_ids,
+                request.num_computed_tokens,
+            )
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -75,8 +115,9 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
-            prompt_embeds=request.prompt_embeds,
-            prompt_is_token_ids=request.prompt_is_token_ids,
+            prompt_embeds=prompt_embeds.embeds,
+            prompt_is_token_ids=prompt_embeds.is_token_ids,
+            prompt_embeds_offset=prompt_embeds.offset,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
         )
@@ -91,7 +132,7 @@ class NewRequestData:
         if self.prompt_token_ids is not None:
             return len(self.prompt_token_ids)
         if self.prompt_embeds is not None:
-            return self.prompt_embeds.shape[0]
+            return self.prompt_embeds_offset + self.prompt_embeds.shape[0]
         return 0
 
     def __repr__(self) -> str:
@@ -108,7 +149,8 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
-            f"prompt_embeds_shape={prompt_embeds_shape}"
+            f"prompt_embeds_shape={prompt_embeds_shape},"
+            f"prompt_embeds_offset={self.prompt_embeds_offset}"
             ")"
         )
 
@@ -130,7 +172,8 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
-            f"prompt_embeds_shape={prompt_embeds_shape}"
+            f"prompt_embeds_shape={prompt_embeds_shape},"
+            f"prompt_embeds_offset={self.prompt_embeds_offset}"
             ")"
         )
 
