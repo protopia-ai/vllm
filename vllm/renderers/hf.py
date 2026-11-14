@@ -84,6 +84,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PROMPT_EMBEDS_MERGE_SPAN: Final[str] = "vllm.prompt_embeds.merge"
+APPLY_CHAT_TEMPLATE_SPAN: Final[str] = "vllm.apply_chat_template"
 
 
 # Cache of `tokenizer -> prompt_embeds placeholder token ID`. Keyed by the
@@ -1278,14 +1279,18 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         if prompt_embeds_tensors:
             visibility_check_kwargs = chat_template_kwargs.copy()
             visibility_check_kwargs["tokenize"] = False
-            rendered = await self._render_with_timeout(
-                self._apply_chat_template_async(
-                    model_config,
-                    tokenizer,
-                    conversation,
-                    **visibility_check_kwargs,
+            with span(
+                APPLY_CHAT_TEMPLATE_SPAN,
+                {SpanAttributes.VLLM_CHAT_TEMPLATE_TOKENIZE: False},
+            ):
+                rendered = await self._render_with_timeout(
+                    self._apply_chat_template_async(
+                        model_config,
+                        tokenizer,
+                        conversation,
+                        **visibility_check_kwargs,
+                    )
                 )
-            )
             assert isinstance(rendered, str)
             prompt_embeds_tensors, conversation = _filter_prompt_embeds_by_template(
                 conversation,
@@ -1299,14 +1304,22 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 logger.warning_once(_TOKENIZE_OVERRIDE_WARNING)
             chat_template_kwargs["tokenize"] = True
 
-        prompt_raw = await self._render_with_timeout(
-            self._apply_chat_template_async(
-                model_config,
-                tokenizer,
-                conversation,
-                **chat_template_kwargs,
+        with span(
+            APPLY_CHAT_TEMPLATE_SPAN,
+            {
+                SpanAttributes.VLLM_CHAT_TEMPLATE_TOKENIZE: bool(
+                    chat_template_kwargs.get("tokenize", True)
+                )
+            },
+        ):
+            prompt_raw = await self._render_with_timeout(
+                self._apply_chat_template_async(
+                    model_config,
+                    tokenizer,
+                    conversation,
+                    **chat_template_kwargs,
+                )
             )
-        )
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
         # model which uses unified vision chunks for both images and videos.

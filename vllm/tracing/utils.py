@@ -51,6 +51,8 @@ class SpanAttributes:
     VLLM_PROMPT_EMBEDS_DTYPE = "vllm.prompt_embeds.dtype"
     VLLM_PROMPT_EMBEDS_SPARSE = "vllm.prompt_embeds.sparse"
     VLLM_NUM_PROMPTS = "vllm.num_prompts"
+    VLLM_NUM_MESSAGES = "vllm.num_messages"
+    VLLM_CHAT_TEMPLATE_TOKENIZE = "vllm.chat_template.tokenize"
 
 
 class LoadingSpanAttributes:
