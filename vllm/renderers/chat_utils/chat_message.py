@@ -22,6 +22,7 @@ from vllm.config import ModelConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import MultiModalDataDict, MultiModalUUIDDict
 from vllm.logger import init_logger
+from vllm.tracing import SpanAttributes, span
 
 from .content_parser import (
     MODALITY_PLACEHOLDERS_MAP,
@@ -58,6 +59,9 @@ from .types import (
 )
 
 logger = init_logger(__name__)
+
+PARSE_CHAT_MESSAGES_SPAN: Final[str] = "vllm.parse_chat_messages"
+RESOLVE_MM_ITEMS_SPAN: Final[str] = "vllm.resolve_mm_items"
 
 
 _PROMPT_EMBEDS_MISSING_DATA_ERROR: Final[str] = (
@@ -827,23 +831,27 @@ async def parse_chat_messages_async(
         media_io_kwargs=media_io_kwargs,
     )
 
-    for msg in messages:
-        sub_messages = parse_chat_message_content(
-            msg,
-            mm_tracker,
-            content_format,
-            interleave_strings=(
-                content_format == "string"
-                and model_config.multimodal_config is not None
-                and model_config.multimodal_config.interleave_mm_strings
-            ),
-            mm_processor_kwargs=mm_processor_kwargs,
-        )
+    with span(
+        PARSE_CHAT_MESSAGES_SPAN, {SpanAttributes.VLLM_NUM_MESSAGES: len(messages)}
+    ):
+        for msg in messages:
+            sub_messages = parse_chat_message_content(
+                msg,
+                mm_tracker,
+                content_format,
+                interleave_strings=(
+                    content_format == "string"
+                    and model_config.multimodal_config is not None
+                    and model_config.multimodal_config.interleave_mm_strings
+                ),
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
 
-        conversation.extend(sub_messages)
+            conversation.extend(sub_messages)
 
-    _postprocess_messages(conversation)
+        _postprocess_messages(conversation)
 
-    mm_data, mm_uuids = await mm_tracker.resolve_items()
+    with span(RESOLVE_MM_ITEMS_SPAN):
+        mm_data, mm_uuids = await mm_tracker.resolve_items()
 
     return conversation, mm_data, mm_uuids
