@@ -204,6 +204,9 @@ class Request:
         gc_untrack(self._output_token_ids)
         # trace_headers
         self.trace_headers = trace_headers
+        # Nanosecond timestamps of the engine's intake stages, set by the engine
+        # core only while a sampled request is being taken in.
+        self.engine_intake_ns: dict[str, Any] | None = None
         self.session_id = session_id
         self.kv_hints = kv_hints
 

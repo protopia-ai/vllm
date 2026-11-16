@@ -7,7 +7,7 @@ import signal
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Generator, Sequence, Sized
+from collections.abc import Callable, Generator, Mapping, Sequence, Sized
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
@@ -44,7 +44,12 @@ from vllm.multimodal.cache import (
 )
 from vllm.outputs import RequestError
 from vllm.tasks import POOLING_TASKS, SupportedTask
-from vllm.tracing import instrument, maybe_init_worker_tracer
+from vllm.tracing import (
+    extract_trace_context,
+    instrument,
+    instrument_manual,
+    maybe_init_worker_tracer,
+)
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.utils import numa_utils
 from vllm.utils.gc_utils import (
@@ -120,6 +125,56 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+
+
+def _trace_sampled(trace_headers: Mapping[str, str] | None) -> bool:
+    """Whether a request's W3C traceparent header marks its trace as sampled."""
+    if not trace_headers:
+        return False
+    traceparent = trace_headers.get("traceparent")
+    if not traceparent:
+        return False
+    try:
+        return bool(int(traceparent.rsplit("-", 1)[1], 16) & 1)
+    except (IndexError, ValueError):
+        return False
+
+
+# Engine intake stages recorded as spans: (span name, start key, end key).
+_ENGINE_INTAKE_STAGES = (
+    ("vllm.engine_core.receive_decode", "recv", "decoded"),
+    ("vllm.engine_core.resolve_prompt_embeds_parts", "resolve_start", "resolve_end"),
+    ("vllm.engine_core.build_request", "build_start", "build_end"),
+    ("vllm.engine_core.input_queue_wait", "put", "dequeued"),
+    ("vllm.engine_core.scheduler_add", "dequeued", "added"),
+)
+
+
+def _emit_engine_intake_spans(request: Request, intake: dict[str, Any]) -> None:
+    """Record a sampled request's engine intake stages as children of its
+    trace context, from the nanosecond timestamps in `intake`.
+
+    Stages run on the engine input thread (receive and decode, rebuilding
+    prompt_embeds from parts, building the Request with its block hashes) and
+    on the busy loop (waiting in the input queue, adding to the scheduler).
+    A stage missing either timestamp is skipped.
+    """
+    try:
+        context = extract_trace_context(request.trace_headers)
+        if context is None:
+            return
+        for name, start, end in _ENGINE_INTAKE_STAGES:
+            if start in intake and end in intake:
+                attributes = (
+                    intake.get("parts_attributes")
+                    if name == "vllm.engine_core.resolve_prompt_embeds_parts"
+                    else None
+                )
+                instrument_manual(
+                    name, intake[start], intake[end], attributes, context=context
+                )
+    except Exception:
+        logger.warning("Could not record engine intake spans", exc_info=True)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -1262,7 +1317,32 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        # Intake timestamps, kept only for requests whose trace is sampled.
+        intake: dict[str, Any] | None = None
+        if _trace_sampled(request.trace_headers):
+            intake = {}
+            parts = request.prompt_embeds_parts
+            if parts is not None:
+                intake["parts_attributes"] = {
+                    "vllm.prompt_embeds.parts": len(parts),
+                    "vllm.prompt_embeds.parts_sent": sum(
+                        1 for part in parts if part.data is not None
+                    ),
+                }
+            intake["resolve_start"] = time.time_ns()
         prompt_embeds_cache.resolve_parts(request)
+        if intake is not None:
+            intake["resolve_end"] = time.time_ns()
+            embeds = request.prompt_embeds
+            if embeds is not None and "parts_attributes" in intake:
+                intake["parts_attributes"]["vllm.prompt_embeds.rows"] = int(
+                    embeds.shape[0]
+                )
+                # `nbytes` reads the size without materializing a prompt_embeds
+                # that is joined from its parts only where read.
+                intake["parts_attributes"]["vllm.prompt_embeds.bytes"] = int(
+                    embeds.nbytes
+                )
 
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
@@ -1287,10 +1367,15 @@ class EngineCore:
                 warn_watermarking_override()
             params.watermarking = True
 
+        if intake is not None:
+            intake["build_start"] = time.time_ns()
         frontend_hashes = frontend_block_hashes(request, self.prefix_hash_config)
         req = Request.from_engine_core_request(
             request, self.request_block_hasher, frontend_hashes
         )
+        if intake is not None:
+            intake["build_end"] = time.time_ns()
+            req.engine_intake_ns = intake
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For
@@ -1972,9 +2057,16 @@ class EngineCoreProc(EngineCore):
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
+            intake = req.engine_intake_ns
+            if intake is not None:
+                intake["dequeued"] = time.time_ns()
             if self._reject_add_in_shutdown(req) or self._reject_add_while_paused(req):
                 return
             self.add_request(req, request_wave)
+            if intake is not None:
+                intake["added"] = time.time_ns()
+                _emit_engine_intake_spans(req, intake)
+                req.engine_intake_ns = None
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -2226,6 +2318,8 @@ class EngineCoreProc(EngineCore):
             del ready_event
             while True:
                 for input_socket, _ in poller.poll():
+                    # Receive start, kept only if the request turns out to be sampled.
+                    recv_ns = time.time_ns()
                     # (RequestType, RequestData)
                     type_frame, *data_frames = input_socket.recv_multipart(copy=False)
                     # NOTE(yongji): ignore READY message sent by DP coordinator
@@ -2239,8 +2333,13 @@ class EngineCoreProc(EngineCore):
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        decoded_ns = time.time_ns()
                         try:
                             request = self.preprocess_add_request(req)
+                            intake = request[0].engine_intake_ns
+                            if intake is not None:
+                                intake["recv"] = recv_ns
+                                intake["decoded"] = decoded_ns
                         except MultiModalCacheMissError as e:
                             # P0/P1 shadow drift -- return a retryable signal (P0
                             # drops the stale entry, client resends with data).
@@ -2275,6 +2374,10 @@ class EngineCoreProc(EngineCore):
                             self.aborts_queue.put_nowait(request)
 
                     # Push to input queue for core busy loop.
+                    if request_type == EngineCoreRequestType.ADD:
+                        intake = request[0].engine_intake_ns
+                        if intake is not None:
+                            intake["put"] = time.time_ns()
                     self.input_queue.put_nowait((request_type, request))
 
     def process_output_sockets(
