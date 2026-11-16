@@ -130,6 +130,14 @@ class ChatCompletionContentPartPromptEmbedsParam(TypedDict, total=False):
     """
     type: Required[Literal["prompt_embeds"]]
     """The type of the content part."""
+    id: str
+    """
+    Content identifier of the part, computed from its content by a trusted
+    gateway in front of vLLM. Used only with the prompt-embeds part cache and
+    `VLLM_PROMPT_EMBEDS_TRUST_PART_IDS`, together with `num_rows`.
+    """
+    num_rows: int
+    """Number of rows (tokens) of the part, given with `id`."""
 
 
 class VideoURL(TypedDict, total=False):

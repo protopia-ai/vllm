@@ -38,6 +38,17 @@ def _truncated_reason(exc: Exception) -> str:
     )
 
 
+def prompt_embeds_hidden_size(model_config: "ModelConfig") -> int:
+    """The row width a loaded `prompt_embeds` tensor must have."""
+    # OPT projects token embeddings to hidden_size inside its decoder. CLIP
+    # and SigLIP still accept text embeddings at hidden_size, not projection_dim.
+    return getattr(
+        model_config.hf_text_config,
+        "word_embed_proj_dim",
+        model_config.get_hidden_size(),
+    )
+
+
 def safe_load_prompt_embeds(
     model_config: "ModelConfig",
     embed: bytes,
@@ -95,13 +106,7 @@ def safe_load_prompt_embeds(
     # also transitively guarantees cross-tensor consistency for requests that
     # include multiple `prompt_embeds` parts, which is required by downstream
     # concatenation in `_build_mixed_prompt_embeds`.
-    # OPT projects token embeddings to hidden_size inside its decoder. CLIP
-    # and SigLIP still accept text embeddings at hidden_size, not projection_dim.
-    expected_hidden_size = getattr(
-        model_config.hf_text_config,
-        "word_embed_proj_dim",
-        model_config.get_hidden_size(),
-    )
+    expected_hidden_size = prompt_embeds_hidden_size(model_config)
     if tensor.shape[1] != expected_hidden_size:
         raise VLLMValidationError(
             f"`prompt_embeds` hidden_size {tensor.shape[1]} does not match "

@@ -19,6 +19,18 @@ With `VLLM_PROMPT_EMBEDS_PART_CACHE_GB` > 0:
 - If the engine evicted a part the frontend assumed it had, the request fails
   with `PromptEmbedsCacheMissError`, a `MultiModalCacheMissError`, and the
   frontend resends it with data. The client never sees the miss.
+- The frontend never joins the parts: the joined `prompt_embeds` is a
+  zero-memory stand-in of the joined shape, and each part's data is sent from
+  the part itself.
+
+With `VLLM_PROMPT_EMBEDS_TRUST_PART_IDS` as well, for deployments where a
+gateway in front of vLLM computes each chat part's `id` from its content:
+
+- A part with an `id` and `num_rows` is keyed by its `id`, not by hashing its
+  decoded rows, and a part the frontend believes the engine holds is not
+  decoded at all: the frontend carries a zero-memory stand-in of its shape.
+- If the engine reports a miss for a part that was left undecoded, the
+  frontend decodes it before the resend.
 
 Keys and layouts travel on the tensor objects themselves, so any step that
 builds a new tensor simply drops them and the request takes the data path.
@@ -28,7 +40,7 @@ import asyncio
 import bisect
 import hashlib
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -49,6 +61,10 @@ logger = init_logger(__name__)
 KEY_PREFIX = "prompt_embeds:"
 _KEY_ATTR = "_vllm_prompt_embeds_part_key"
 _LAYOUT_ATTR = "_vllm_prompt_embeds_layout"
+# On a part stand-in: a coroutine function that decodes the real part.
+_LOAD_ATTR = "_vllm_prompt_embeds_part_load"
+# On a joined stand-in: the part of each layout segment, None for zeros.
+_SEGMENTS_ATTR = "_vllm_prompt_embeds_segments"
 _BYTES_PER_GB = 1 << 30
 
 
@@ -107,6 +123,78 @@ async def tag_part(tensor: torch.Tensor) -> None:
     setattr(tensor, _KEY_ATTR, key)
 
 
+def trusted_part_key(part_id: str | None) -> str | None:
+    """The key of a part whose client-supplied `id` is trusted, else None.
+
+    Trusted only with `VLLM_PROMPT_EMBEDS_TRUST_PART_IDS`, for deployments
+    where a gateway in front of vLLM computes each part's `id` from its
+    content. vLLM does not check that an `id` matches its `data`, so a client
+    that can set `id` directly could bind it to other content.
+    """
+    if part_id is None or not enabled() or not envs.VLLM_PROMPT_EMBEDS_TRUST_PART_IDS:
+        return None
+    return f"{KEY_PREFIX}id:{part_id}"
+
+
+def key_part(tensor: torch.Tensor, key: str) -> None:
+    """Key a loaded part by its trusted `id` instead of hashing its rows."""
+    setattr(tensor, _KEY_ATTR, key)
+
+
+def engine_holds(key: str) -> bool:
+    """Whether this process's frontend sender believes every engine it has
+    sent to holds the part `key`, so the part need not be decoded."""
+    return _sender is not None and _sender.holds(key)
+
+
+def part_stand_in(
+    num_rows: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    key: str,
+    load: Callable[[], Awaitable[torch.Tensor]],
+) -> torch.Tensor:
+    """A zero-memory `(num_rows, hidden_size)` tensor for a part the engine
+    holds, keyed by `key`. Its rows are never read: the part goes to the
+    engine as a ref. `load` decodes the real part if the engine reports a
+    miss and the part has to be resent with data."""
+    stand_in = torch.zeros(1, hidden_size, dtype=dtype).expand(num_rows, -1)
+    setattr(stand_in, _KEY_ATTR, key)
+    setattr(stand_in, _LOAD_ATTR, load)
+    return stand_in
+
+
+def _layout_for(
+    total_rows: int,
+    parts: Sequence[torch.Tensor],
+    positions: Sequence[tuple[int, int]],
+) -> tuple[_Layout, tuple[torch.Tensor | None, ...]] | None:
+    """The layout of `total_rows` rows holding each part at its
+    `(start, length)` position and zeros elsewhere, with the part of each
+    segment (None for zeros), if every part is keyed."""
+    keys: list[str | None] = []
+    segments: list[torch.Tensor | None] = []
+    offsets = [0]
+    for part, (start, length) in zip(parts, positions, strict=True):
+        key = getattr(part, _KEY_ATTR, None)
+        if key is None:
+            return None
+        if start > offsets[-1]:
+            keys.append(None)
+            segments.append(None)
+            offsets.append(start)
+        keys.append(key)
+        segments.append(part)
+        offsets.append(start + length)
+    if offsets[-1] < total_rows:
+        keys.append(None)
+        segments.append(None)
+        offsets.append(total_rows)
+    if not keys:
+        return None
+    return _Layout(tuple(keys), tuple(offsets)), tuple(segments)
+
+
 def tag_joined(
     joined: torch.Tensor,
     parts: Sequence[torch.Tensor],
@@ -114,22 +202,35 @@ def tag_joined(
 ) -> None:
     """Record that `joined` holds each part at its `(start, length)` position
     and zeros elsewhere, if every part is keyed."""
-    keys: list[str | None] = []
-    offsets = [0]
-    for part, (start, length) in zip(parts, positions, strict=True):
-        key = getattr(part, _KEY_ATTR, None)
-        if key is None:
-            return
-        if start > offsets[-1]:
-            keys.append(None)
-            offsets.append(start)
-        keys.append(key)
-        offsets.append(start + length)
-    if offsets[-1] < len(joined):
-        keys.append(None)
-        offsets.append(len(joined))
-    if keys:
-        setattr(joined, _LAYOUT_ATTR, _Layout(tuple(keys), tuple(offsets)))
+    found = _layout_for(len(joined), parts, positions)
+    if found is not None:
+        setattr(joined, _LAYOUT_ATTR, found[0])
+
+
+def join_lazily(
+    total_rows: int,
+    parts: Sequence[torch.Tensor],
+    positions: Sequence[tuple[int, int]],
+) -> torch.Tensor | None:
+    """A zero-memory stand-in for the joined `prompt_embeds`, or None when
+    the rows must really be joined.
+
+    With a frontend sender in this process and every part keyed, the joined
+    rows are never read on the frontend: the sender sends the engine refs and
+    the data of each part it has not sent, taken from the parts themselves.
+    The stand-in has the joined shape, so length checks work unchanged.
+    """
+    if _sender is None or not parts:
+        return None
+    found = _layout_for(total_rows, parts, positions)
+    if found is None:
+        return None
+    layout, segments = found
+    stand_in = torch.zeros(1, parts[0].shape[1], dtype=parts[0].dtype)
+    stand_in = stand_in.expand(total_rows, -1)
+    setattr(stand_in, _LAYOUT_ATTR, layout)
+    setattr(stand_in, _SEGMENTS_ATTR, segments)
+    return stand_in
 
 
 def _layout_of(tensor: torch.Tensor | None) -> _Layout | None:
@@ -156,24 +257,48 @@ class PromptEmbedsPartSender:
 
     @classmethod
     def from_env(cls) -> "PromptEmbedsPartSender | None":
-        return cls(capacity_bytes()) if enabled() else None
+        """The sender for this process's frontend, registered so the content
+        parser and renderer can skip decoding and joining parts."""
+        global _sender
+        if not enabled():
+            return None
+        _sender = cls(capacity_bytes())
+        return _sender
+
+    def holds(self, key: str) -> bool:
+        """Whether every engine this sender has sent to is believed to hold
+        `key`. A request may go to any of them."""
+        return bool(self._sent) and all(key in sent for sent in self._sent.values())
 
     def to_refs(self, request: "EngineCoreRequest", engine: Any) -> "EngineCoreRequest":
         layout = _layout_of(request.prompt_embeds)
         if layout is None:
             return request
         assert request.prompt_embeds is not None
+        segments = getattr(request.prompt_embeds, _SEGMENTS_ATTR, None)
         sent = self._sent.setdefault(engine, OrderedDict())
         row_bytes = request.prompt_embeds[:1].nbytes
         refs = []
-        for key, start, end in zip(layout.keys, layout.offsets, layout.offsets[1:]):
+        for index, (key, start, end) in enumerate(
+            zip(layout.keys, layout.offsets, layout.offsets[1:])
+        ):
             data = None
+            part = (
+                request.prompt_embeds[start:end]
+                if segments is None
+                else segments[index]
+            )
             if key is None:
                 pass
             elif key in sent:
                 sent.move_to_end(key)
+            elif hasattr(part, _LOAD_ATTR):
+                # Not decoded because the engine was believed to hold it. Sent
+                # as a ref anyway: if the engine no longer has it, it reports
+                # a miss and `load_parts` decodes it for the resend.
+                pass
             else:
-                data = request.prompt_embeds[start:end]
+                data = part
                 self._remember(engine, key, (end - start) * row_bytes)
             refs.append(PromptEmbedsPartRef(key, end - start, data))
         self._pending[request.request_id] = request
@@ -220,6 +345,30 @@ class PromptEmbedsPartSender:
             )
             outputs.outputs = kept
         return resend
+
+    async def load_parts(self, request: "EngineCoreRequest") -> None:
+        """Decode the parts of `request` that were left undecoded and that no
+        engine is believed to hold any more, before it is resent."""
+        joined = request.prompt_embeds
+        segments = getattr(joined, _SEGMENTS_ATTR, None)
+        layout = _layout_of(joined)
+        if segments is None or layout is None:
+            return
+        loaded = list(segments)
+        for index, (key, part) in enumerate(zip(layout.keys, segments)):
+            load = getattr(part, _LOAD_ATTR, None)
+            if key is None or load is None:
+                continue
+            if any(key in sent for sent in self._sent.values()):
+                continue
+            tensor = await load()
+            key_part(tensor, key)
+            loaded[index] = tensor
+        setattr(joined, _SEGMENTS_ATTR, tuple(loaded))
+
+
+# This process's frontend sender, set by `PromptEmbedsPartSender.from_env`.
+_sender: PromptEmbedsPartSender | None = None
 
 
 class PromptEmbedsPartStore:

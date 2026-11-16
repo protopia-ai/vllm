@@ -231,6 +231,10 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
     def get_num_items(self, modality: ModalityStr) -> int:
         return len(self._items_by_modality.get(modality, ()))
 
+    def has_only(self, modality: ModalityStr) -> bool:
+        """Whether every item added so far is of `modality`."""
+        return self._items_by_modality.keys() <= {modality}
+
     @cached_property
     def model_cls(self) -> type[SupportsMultiModal]:
         from vllm.model_executor.model_loader import get_model_cls

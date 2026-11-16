@@ -239,17 +239,26 @@ def _build_mixed_prompt_embeds(
     positions: list[tuple[int, int]],
 ) -> tuple[torch.Tensor, list[bool]]:
     """Build the full-length `prompt_embeds` tensor and the `is_token_ids`
-    mask aligned to `token_ids`."""
+    mask aligned to `token_ids`.
+
+    When the parts go to the engine as part-cache refs, the tensor is a
+    zero-memory stand-in and the rows are never joined on the frontend (see
+    `prompt_embeds_cache.join_lazily`)."""
     total_len = len(token_ids)
     hidden_size = prompt_embeds_tensors[0].shape[1]
     dtype = prompt_embeds_tensors[0].dtype
 
-    full_embeds = torch.zeros(total_len, hidden_size, dtype=dtype)
     is_token_ids = torch.ones(total_len, dtype=torch.bool)
+    for start, length in positions:
+        is_token_ids[start : start + length] = False
 
+    lazy = prompt_embeds_cache.join_lazily(total_len, prompt_embeds_tensors, positions)
+    if lazy is not None:
+        return lazy, is_token_ids.tolist()
+
+    full_embeds = torch.zeros(total_len, hidden_size, dtype=dtype)
     for (start, length), tensor in zip(positions, prompt_embeds_tensors, strict=True):
         full_embeds[start : start + length] = tensor
-        is_token_ids[start : start + length] = False
 
     prompt_embeds_cache.tag_joined(full_embeds, prompt_embeds_tensors, positions)
     return full_embeds, is_token_ids.tolist()
