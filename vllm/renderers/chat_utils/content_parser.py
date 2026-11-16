@@ -16,6 +16,7 @@ from vllm.config import ModelConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.media import MEDIA_CONNECTOR_REGISTRY, MediaConnector
 from vllm.renderers.embed_utils import (
+    prompt_embeds_hidden_size,
     safe_load_prompt_embeds,
     safe_load_prompt_embeds_async,
 )
@@ -52,6 +53,15 @@ def make_prompt_embeds_placeholder(index: int) -> str:
 
 _ENABLE_PROMPT_EMBEDS_ERROR: Final[str] = (
     "You must set `--enable-prompt-embeds` to input `prompt_embeds`"
+)
+
+_PROMPT_EMBEDS_NUM_ROWS_ERROR: Final[str] = (
+    "A `prompt_embeds` content part with an `id` needs `num_rows`, a positive integer."
+)
+
+_PROMPT_EMBEDS_ROWS_MISMATCH_ERROR: Final[str] = (
+    "A `prompt_embeds` content part gives `num_rows` {num_rows} but its "
+    "`data` has {actual} rows."
 )
 
 
@@ -118,7 +128,9 @@ class BaseMultiModalContentParser(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def parse_prompt_embeds(self, data: str) -> None:
+    def parse_prompt_embeds(
+        self, data: str, part_id: str | None = None, num_rows: int | None = None
+    ) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -164,12 +176,17 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         return self._tracker.model_config
 
     @override
-    def parse_prompt_embeds(self, data: str) -> None:
+    def parse_prompt_embeds(
+        self, data: str, part_id: str | None = None, num_rows: int | None = None
+    ) -> None:
         """Decode a base64 prompt embeds tensor and store it in the tracker.
 
         Emits a single `PROMPT_EMBEDS_PLACEHOLDER_TOKEN` sentinel per
         content part. The renderer later expands each sentinel to a span of
         `tensor.shape[0]` placeholder tokens after tokenization.
+
+        `part_id` and `num_rows` are not used: the part cache that uses them
+        runs only with the async frontend.
         """
         if not self.model_config.enable_prompt_embeds:
             raise VLLMValidationError(
@@ -357,31 +374,83 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         return item, uuid
 
     @override
-    def parse_prompt_embeds(self, data: str) -> None:
+    def parse_prompt_embeds(
+        self, data: str, part_id: str | None = None, num_rows: int | None = None
+    ) -> None:
         """Schedule async prompt embeds decode and store the coroutine in the tracker.
 
         Like the sync variant, emits a single sentinel `PROMPT_EMBEDS_PLACEHOLDER_TOKEN`
         per content part. Unlike the sync variant, the tensor decode is deferred to a
         thread-pool executor via `safe_load_prompt_embeds_async`.
+
+        With the part cache on and part ids trusted (see
+        `prompt_embeds_cache.trusted_part_key`), a part with an `id` and
+        `num_rows` is keyed by its `id`, and is not decoded at all when the
+        engine already holds it.
         """
         if not self.model_config.enable_prompt_embeds:
             raise VLLMValidationError(
                 _ENABLE_PROMPT_EMBEDS_ERROR, parameter="prompt_embeds"
             )
 
+        key = prompt_embeds_cache.trusted_part_key(part_id)
+        if key is not None and (
+            not isinstance(num_rows, int) or isinstance(num_rows, bool) or num_rows < 1
+        ):
+            raise VLLMValidationError(
+                _PROMPT_EMBEDS_NUM_ROWS_ERROR, parameter="prompt_embeds"
+            )
         self._tracker.add(
-            "prompt_embeds", partial(self._load_prompt_embeds_async, data.encode())
+            "prompt_embeds",
+            partial(self._load_prompt_embeds_async, data.encode(), key, num_rows),
         )
         self._add_placeholder("prompt_embeds", PROMPT_EMBEDS_PLACEHOLDER_TOKEN)
 
     async def _load_prompt_embeds_async(
-        self, data_bytes: bytes
+        self, data_bytes: bytes, key: str | None = None, num_rows: int | None = None
     ) -> tuple[torch.Tensor, None]:
         # Second tuple slot fills the tracker's generic `(item, uuid | None)`
         # contract. prompt_embeds has no UUID concept, so it's always `None`.
+        load = partial(self._decode_prompt_embeds_part, data_bytes, key, num_rows)
+        # Other modalities take the parts as multimodal data, so only a
+        # prompt_embeds-only request can leave a part undecoded.
+        if (
+            key is not None
+            and num_rows is not None
+            and self._tracker.has_only("prompt_embeds")
+            and prompt_embeds_cache.engine_holds(key)
+        ):
+            # A resolved `ModelConfig` always holds a `torch.dtype` here.
+            dtype = self.model_config.dtype
+            assert isinstance(dtype, torch.dtype)
+            stand_in = prompt_embeds_cache.part_stand_in(
+                num_rows,
+                prompt_embeds_hidden_size(self.model_config),
+                dtype,
+                key,
+                load,
+            )
+            return stand_in, None
+        return await load(), None
+
+    async def _decode_prompt_embeds_part(
+        self, data_bytes: bytes, key: str | None, num_rows: int | None
+    ) -> torch.Tensor:
+        """Decode one part and key it: by its trusted `id` when it has one,
+        else by a hash of its rows."""
         tensor = await safe_load_prompt_embeds_async(self.model_config, data_bytes)
-        await prompt_embeds_cache.tag_part(tensor)
-        return tensor, None
+        if key is None:
+            await prompt_embeds_cache.tag_part(tensor)
+            return tensor
+        if tensor.shape[0] != num_rows:
+            raise VLLMValidationError(
+                _PROMPT_EMBEDS_ROWS_MISMATCH_ERROR.format(
+                    num_rows=num_rows, actual=tensor.shape[0]
+                ),
+                parameter="prompt_embeds",
+            )
+        prompt_embeds_cache.key_part(tensor, key)
+        return tensor
 
     async def _image_with_uuid_async(self, image_url: str | None, uuid: str | None):
         image = (

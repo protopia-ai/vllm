@@ -1290,7 +1290,9 @@ class AsyncMPClient(MPClient):
                         # Resend requests whose cached parts the engine evicted.
                         for request in prompt_embeds_sender.take_misses(outputs):
                             if _self := _self_ref():
-                                asyncio.create_task(_self.add_request_async(request))
+                                asyncio.create_task(
+                                    _self._resend_with_prompt_embeds_parts(request)
+                                )
 
                     if output_handler is not None:
                         assert _self_ref is not None
@@ -1379,6 +1381,15 @@ class AsyncMPClient(MPClient):
 
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         return await self.call_utility_async("get_supported_tasks")
+
+    async def _resend_with_prompt_embeds_parts(
+        self, request: EngineCoreRequest
+    ) -> None:
+        """Resend a request whose prompt-embeds parts the engine evicted,
+        first decoding any of them that were left undecoded."""
+        assert self.prompt_embeds_sender is not None
+        await self.prompt_embeds_sender.load_parts(request)
+        await self.add_request_async(request)
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index

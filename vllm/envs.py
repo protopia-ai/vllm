@@ -241,6 +241,7 @@ if TYPE_CHECKING:
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_PROMPT_EMBEDS_PART_CACHE_GB: float = 0.0
+    VLLM_PROMPT_EMBEDS_TRUST_PART_IDS: bool = False
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
     VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
     VLLM_NIXL_SIDE_CHANNEL_HOST: str = "localhost"
@@ -1849,6 +1850,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # turn. 0 disables it. See `vllm/v1/prompt_embeds_cache.py`.
     "VLLM_PROMPT_EMBEDS_PART_CACHE_GB": lambda: float(
         os.getenv("VLLM_PROMPT_EMBEDS_PART_CACHE_GB", "0")
+    ),
+    # If set, with the prompt-embeds part cache on, key chat `prompt_embeds`
+    # parts by their `id` field instead of hashing their decoded rows, and
+    # skip decoding parts the engine already holds. Only for deployments where
+    # a gateway in front of vLLM computes each `id` from the part's content:
+    # vLLM does not check that an `id` matches its `data`.
+    "VLLM_PROMPT_EMBEDS_TRUST_PART_IDS": lambda: bool(
+        int(os.getenv("VLLM_PROMPT_EMBEDS_TRUST_PART_IDS", "0"))
     ),
     # If set, allow insecure serialization using pickle.
     # This is useful for environments where it is deemed safe to use the
