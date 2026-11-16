@@ -49,6 +49,7 @@ from vllm.renderers.chat_utils.content_parser import (
     PROMPT_EMBEDS_PLACEHOLDER_ID_PREFIX,
 )
 from vllm.tokenizers.hf import HfTokenizer
+from vllm.tracing import SpanAttributes, span
 from vllm.transformers_utils.chat_templates import (
     get_chat_template_fallback_path,
     get_chat_template_override_path,
@@ -81,6 +82,9 @@ if TYPE_CHECKING:
     from .params import ChatParams
 
 logger = init_logger(__name__)
+
+PROMPT_EMBEDS_MERGE_SPAN: Final[str] = "vllm.prompt_embeds.merge"
+APPLY_CHAT_TEMPLATE_SPAN: Final[str] = "vllm.apply_chat_template"
 
 
 # Cache of `tokenizer -> prompt_embeds placeholder token ID`. Keyed by the
@@ -1275,14 +1279,18 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         if prompt_embeds_tensors:
             visibility_check_kwargs = chat_template_kwargs.copy()
             visibility_check_kwargs["tokenize"] = False
-            rendered = await self._render_with_timeout(
-                self._apply_chat_template_async(
-                    model_config,
-                    tokenizer,
-                    conversation,
-                    **visibility_check_kwargs,
+            with span(
+                APPLY_CHAT_TEMPLATE_SPAN,
+                {SpanAttributes.VLLM_CHAT_TEMPLATE_TOKENIZE: False},
+            ):
+                rendered = await self._render_with_timeout(
+                    self._apply_chat_template_async(
+                        model_config,
+                        tokenizer,
+                        conversation,
+                        **visibility_check_kwargs,
+                    )
                 )
-            )
             assert isinstance(rendered, str)
             prompt_embeds_tensors, conversation = _filter_prompt_embeds_by_template(
                 conversation,
@@ -1296,14 +1304,22 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 logger.warning_once(_TOKENIZE_OVERRIDE_WARNING)
             chat_template_kwargs["tokenize"] = True
 
-        prompt_raw = await self._render_with_timeout(
-            self._apply_chat_template_async(
-                model_config,
-                tokenizer,
-                conversation,
-                **chat_template_kwargs,
+        with span(
+            APPLY_CHAT_TEMPLATE_SPAN,
+            {
+                SpanAttributes.VLLM_CHAT_TEMPLATE_TOKENIZE: bool(
+                    chat_template_kwargs.get("tokenize", True)
+                )
+            },
+        ):
+            prompt_raw = await self._render_with_timeout(
+                self._apply_chat_template_async(
+                    model_config,
+                    tokenizer,
+                    conversation,
+                    **chat_template_kwargs,
+                )
             )
-        )
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
         # model which uses unified vision chunks for both images and videos.
@@ -1410,11 +1426,15 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         engine_input = await super()._process_tokens_async(
             prompt, skip_mm_cache=skip_mm_cache
         )
-        self._apply_prompt_embeds_to_engine_input(
-            cast(MultiModalInput, engine_input),
-            tensors,
-            mm_updates,
-        )
+        with span(
+            PROMPT_EMBEDS_MERGE_SPAN,
+            {SpanAttributes.VLLM_PROMPT_EMBEDS_NUM_PARTS: len(tensors)},
+        ):
+            self._apply_prompt_embeds_to_engine_input(
+                cast(MultiModalInput, engine_input),
+                tensors,
+                mm_updates,
+            )
 
         return engine_input
 
@@ -1445,21 +1465,29 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 f"{len(embeds_orig_positions)}."
             )
 
-        mm_updates = _build_prompt_embeds_updates(
-            prompt_embeds_tensors, placeholder_token_id
-        )
-        expanded = _expand_prompt_embeds_placeholders(token_ids, mm_updates)
-        positions = _build_prompt_embeds_positions(
-            expanded, len(prompt_embeds_tensors), mm_updates
-        )
+        with span(
+            PROMPT_EMBEDS_MERGE_SPAN,
+            {SpanAttributes.VLLM_PROMPT_EMBEDS_NUM_PARTS: len(prompt_embeds_tensors)},
+        ) as current:
+            mm_updates = _build_prompt_embeds_updates(
+                prompt_embeds_tensors, placeholder_token_id
+            )
+            expanded = _expand_prompt_embeds_placeholders(token_ids, mm_updates)
+            positions = _build_prompt_embeds_positions(
+                expanded, len(prompt_embeds_tensors), mm_updates
+            )
 
-        embeds_prompt = cast(EmbedsPrompt, prompt)
-        embeds_prompt["prompt_token_ids"] = expanded
-        full_embeds, is_token_ids_mask = _build_mixed_prompt_embeds(
-            expanded, prompt_embeds_tensors, positions
-        )
-        embeds_prompt["prompt_embeds"] = full_embeds
-        embeds_prompt["prompt_is_token_ids"] = is_token_ids_mask
+            embeds_prompt = cast(EmbedsPrompt, prompt)
+            embeds_prompt["prompt_token_ids"] = expanded
+            full_embeds, is_token_ids_mask = _build_mixed_prompt_embeds(
+                expanded, prompt_embeds_tensors, positions
+            )
+            embeds_prompt["prompt_embeds"] = full_embeds
+            embeds_prompt["prompt_is_token_ids"] = is_token_ids_mask
+            if current is not None:
+                current.set_attribute(
+                    SpanAttributes.VLLM_PROMPT_EMBEDS_NUM_TOKENS, len(expanded)
+                )
 
     def _apply_prompt_embeds_to_engine_input(
         self,
