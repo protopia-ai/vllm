@@ -1338,8 +1338,10 @@ class EngineCore:
                 intake["parts_attributes"]["vllm.prompt_embeds.rows"] = int(
                     embeds.shape[0]
                 )
+                # `nbytes` reads the size without materializing a prompt_embeds
+                # that is joined from its parts only where read.
                 intake["parts_attributes"]["vllm.prompt_embeds.bytes"] = int(
-                    embeds.numel() * embeds.element_size()
+                    embeds.nbytes
                 )
 
         # Note on thread safety: no race condition.
