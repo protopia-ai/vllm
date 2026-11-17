@@ -39,7 +39,11 @@ class DefaultModelState(ModelState):
         self.prompt_embeds_state: PromptEmbedsState | None = None
         if self.model_config.enable_prompt_embeds:
             self.prompt_embeds_state = PromptEmbedsState(
-                self.max_num_reqs, self.inputs_embeds_size, self.dtype, self.device
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.inputs_embeds_size,
+                self.dtype,
+                self.device,
             )
             if not self.supports_mm_inputs:
                 # Persistent buffer analogous to encoder_runner.inputs_embeds.
